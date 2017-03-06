@@ -35,15 +35,12 @@ import sys
 
 
 class Action(object):
-    """Enum of possible actions on lists. (Local problems with enum
-    package...)
+    """
+    Enum of possible actions.
     """
 
-    class NONE(object):
-        pass
-
-    class CHANGE_FOOTER:
-        pass
+    CHANGE_OPTION_FOR_ALL_LISTS = "CHANGE_OPTION_FOR_ALL_LISTS"
+    CHANGE_OPTION_FOR_SINGLE_LISTS = "CHANGE_OPTION_FOR_SINGLE_LISTS"
 
 
 def password_field_in_response(text):
@@ -84,6 +81,13 @@ def login(session, list_url, password=None):
 
     return True
 
+def list_url_concat(base_url, list_name):
+    list_url = base_url
+    if base_url[-1] != '/':
+        list_url += "/"
+    list_url += list_name
+    return list_url
+
 
 def connect(session, base_url, list_name, password=None):
     """Connect to a list and login.
@@ -96,11 +100,7 @@ def connect(session, base_url, list_name, password=None):
     :rtype: bool, string
 
     """
-
-    list_url = base_url
-    if base_url[-1] != '/':
-        list_url += "/"
-    list_url += list_name
+    list_url = list_url_concat(base_url, list_name)
 
     r = session.get(list_url)
     logging.info("Connected to List {}: {} {}".format(list_name, r.status_code,
@@ -116,21 +116,23 @@ def connect(session, base_url, list_name, password=None):
     return True, list_url
 
 
-def change_footer(session, list_url, new_footer):
-    """Change the nondigest msg_footer for the given list. Needs to be
-    logged in with sufficient privilidges.
+def change_option(session, list_url, form, key, value):
+    """Change the value of a key (e.g. "msg_footer") in a form
+    (e.g. "nondigest") for the given list. Needs to be logged in with
+    sufficient privilidges.
 
     :param requests.Session session: Use this session for the connection.
     :param str list_url: The url to log in to.
-    :param str new_footer: The new footer value.
+    :param str form: Which form contains the key? (e.g. "nondigest").
+    :param str key: Key to be changed (e.g. "msg_footer").
+    :param str value: The new value.
     :rtype: None
-
     """
 
     url = list_url
     if url[-1] != '/':
         url += "/"
-    url += "nondigest"
+    url += form
 
     r = session.get(url)
     token_match = re.search(r'name="csrf_token"\s*value="([^"]+)"', r.text)
@@ -139,15 +141,57 @@ def change_footer(session, list_url, new_footer):
     else:
         raise Exception("Could not finde csrf_token in {}".format(r.text))
 
-    post_data = {"msg_footer": new_footer, "csrf_token": token}
+    post_data = {key: value, "csrf_token": token}
     r = session.post(url, data=post_data)
 
-    logging.info("Footer changed")
-    logging.debug("to '{}'".format(new_footer))
+    logging.info("{} changed".format(key))
+    logging.debug("to '{}'".format(value))
 
 
-def help():
-    """Print the usage message."""
+def change_option_for_all_lists(session, config):
+    """ Set a mailman key=value for all (advertised) lists at a given site.
+
+    :param requests.Session session: Session for the connection.
+    :param dict config: The configuration needs to contain the keys:
+                        "base_url", "form", "key", "value"
+                        and might contain "global_passwd".
+    :rtype: None
+
+    """
+
+    r = session.get(config["base_url"])
+    list_names = re.finditer(r'href="admin/([^"]+)"', r.text)
+
+    for match in list_names:
+        # mailman polutes cookies until 400 cookies too large...
+        # ->clear
+        session.cookies.clear()
+        config["list_name"] = match.group(1)
+        change_option_for_single_list(session, config)
+
+    logging.info("{} lists processed.".format(len([list_names])))
+
+
+def change_option_for_single_list(session, config):
+    """ Set a mailman key=value for a given list.
+
+    :param requests.Session session: Session for the connection.
+    :param dict config: The configuration needs to contain the keys:
+                        "list_name", "base_url", "form", "key", "value"
+                        and might contain "global_passwd".
+    :rtype: None
+
+    """
+    logging.info("Connecting to List '{}'".format(config["list_name"]))
+    success, list_url = connect(session, config["base_url"],
+                                config["list_name"],
+                                config.get("global_passwd", None))
+    if not success:
+        logging.error(
+            "Could not connect to list '{}'".format(config["list_name"]))
+    else:
+        change_option(session, list_url, config["form"],
+                      config["key"], config["value"])
 
 
 def main():
@@ -176,11 +220,18 @@ def main():
     parser.add_argument(
         "-a",
         "--action",
-        help="Which action to perform. " + "Default: CHANGE_FOOTER",
-        choices=["CHANGE_FOOTER"],
-        default="CHANGE_FOOTER")
+        help="Which action to perform.",
+        choices=[
+            "CHANGE_OPTION_FOR_ALL_LISTS", "CHANGE_OPTION_FOR_SINGLE_LISTS"
+        ])
     parser.add_argument(
         "-v", "--value", help="Value for the action, e.g. new footer msg.")
+    parser.add_argument(
+        "-k", "--key", help="Key for the action, e.g. 'msg_footer'.")
+    parser.add_argument(
+        "-f", "--form", help="Form containing the key, e.g. 'nondigest'.")
+    parser.add_argument(
+        "-n", "--list-name", help="List to be changed.")
     parser.add_argument(
         "-l",
         "--log",
@@ -226,43 +277,36 @@ def main():
        and not config.get("global_passwd", None):
         config["global_passwd"] = getpass()
 
+    if args.form:
+        config["form"] = args.form
+    logging.info("form: '{}'".format(config.get("form", None)))
+
+    if args.key:
+        config["key"] = args.key
+    logging.info("key: '{}'".format(config.get("key", None)))
+
     if args.value:
         config["value"] = args.value
-
     logging.info("value: '{}'".format(config.get("value", None)))
 
-    action = Action.NONE
-    if args.action == "CHANGE_FOOTER":
-        action = Action.CHANGE_FOOTER()
-    elif config.get("action", None) == "CHANGE_FOOTER":
-        action = Action.CHANGE_FOOTER()
+    if args.list_name:
+        config["list_name"] = args.list_name
+    logging.info("list_name: '{}'".format(config.get("list_name", None)))
 
+    if args.action:
+        config["action"] = args.action
+
+    action = config.get("action", None)
     logging.info("action: '{}'".format(action))
 
-    session = requests.Session()
-    r = session.get(config["base_url"])
-    list_names = re.finditer(r'href="admin/([^"]+)"', r.text)
+    if action == Action.CHANGE_OPTION_FOR_ALL_LISTS:
+        change_option_for_all_lists(requests.Session(), config)
+    elif action == Action.CHANGE_OPTION_FOR_SINGLE_LISTS:
+        change_option_for_single_list(requests.Session(), config)
+    else:
+        logging.error("Action {} is not supported.".format(action))
 
-    for match in list_names:
-        # mailman polutes cookies until 400 cookies too large...
-        # ->clear
-        session.cookies.clear()
-        list_name = match.group(1)
-        logging.info("Connecting to List '{}'".format(list_name))
-        success, list_url = connect(session, config["base_url"], list_name,
-                                    config.get("global_passwd", None))
-        if not success:
-            logging.error("Could not connect to list '{}'".format(list_name))
-            continue
-
-        if isinstance(action, Action.CHANGE_FOOTER):
-            change_footer(session, list_url, config["value"])
-        else:
-            logging.error("Action {} is not supported.".format(action))
-
-        logging.debug("Finished actions on list {}\n".format(list_name))
-
-    logging.info("{} lists processed.".format(len(list_names)))
+    logging.info("[FINISHED]")
 
 
 # goto main
